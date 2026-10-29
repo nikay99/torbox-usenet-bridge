@@ -1,0 +1,50 @@
+# Minimal example: rclone mounts TorBox WebDAV, the bridge creates symlinks into it,
+# Radarr/Sonarr import those symlinks. All containers must see the mount at the same path.
+services:
+  torbox-webdav:
+    image: rclone/rclone:latest
+    container_name: torbox-webdav
+    command: >
+      mount torbox: /mnt/torbox --read-only --allow-other --uid 1000 --gid 1000
+      --dir-cache-time 30s --vfs-cache-mode off
+    environment:
+      RCLONE_CONFIG_TORBOX_TYPE: webdav
+      RCLONE_CONFIG_TORBOX_URL: https://webdav.torbox.app
+      RCLONE_CONFIG_TORBOX_VENDOR: other
+      RCLONE_CONFIG_TORBOX_USER: ${TORBOX_EMAIL}
+      RCLONE_CONFIG_TORBOX_PASS: ${TORBOX_WEBDAV_PASS_OBSCURED}   # output of `rclone obscure <password>`
+    devices: [/dev/fuse]
+    cap_add: [SYS_ADMIN]
+    security_opt: [apparmor:unconfined]
+    volumes:
+      - /mnt:/mnt:rshared
+    healthcheck:
+      test: ["CMD-SHELL", "ls /mnt/torbox | head -1 | grep -q ."]
+      interval: 30s
+      retries: 10
+    restart: unless-stopped
+
+  torbox-usenet-bridge:
+    build: .
+    container_name: torbox-usenet-bridge
+    env_file: .env
+    environment:
+      MOUNT_DIR: /mnt/torbox
+      COMPLETE_DIR: /data/downloads
+      LIBRARY_DIRS: /data/media
+      PUID: "1000"
+      PGID: "1000"
+    volumes:
+      - ./data:/app/data
+      - /data:/data
+      - /mnt:/mnt:rslave
+    ports:
+      - "8383:8383"
+    depends_on:
+      torbox-webdav:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # radarr / sonarr need the same mounts:
+  #   - /data:/data
+  #   - /mnt:/mnt:rslave
