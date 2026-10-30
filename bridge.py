@@ -4,12 +4,19 @@ Flow: Radarr/Sonarr send an NZB (addfile/addurl) -> the bridge submits it to Tor
 TorBox has the files -> creates symlinks under COMPLETE_DIR/<category>/<name>/ that point into the TorBox
 WebDAV mount (MOUNT_DIR, e.g. via rclone) -> reports "Completed" in the history. Nothing is downloaded locally.
 
+TorBox limits are respected: submissions wait for a free slot (TORBOX_MAX_ACTIVE), stay below the hourly
+createusenetdownload budget (TORBOX_SUBMITS_PER_HOUR) and pause all API calls after a 429. "Busy" never
+marks a job as failed, so Radarr/Sonarr don't blocklist good releases.
+
 Repair: if a library symlink points into the mount but its target is gone (TorBox removed the download),
-the stored NZB is submitted to TorBox again so the symlink becomes valid again.
+the stored NZB is submitted to TorBox again (at most once per day per release).
 
 Audio language guard (optional): releases whose name matches GUARD_RELEASE_REGEX (default: MULTi) are checked
 after import using the real audio tracks reported by Radarr/Sonarr (mediaInfo). If none of
 REQUIRED_AUDIO_LANGS is present, the grab is marked as failed (-> blocklist + new search) and the file is removed.
+Radarr/Sonarr can trigger the check right after an import via the webhook /guard?apikey=SAB_API_KEY.
+
+Cleanup (optional, off by default): deletes TorBox downloads that no library symlink uses anymore.
 """
 import json
 import logging
@@ -26,7 +33,7 @@ from email.parser import BytesParser
 from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def env_secret(name, file_default):
@@ -37,6 +44,10 @@ def env_secret(name, file_default):
     if path and os.path.exists(path):
         return open(path).read().strip()
     raise SystemExit(f"Missing {name} (or {name}_FILE)")
+
+
+def flag(name, default):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 API = os.environ.get("TORBOX_API_URL", "https://api.torbox.app/v1/api")
@@ -56,12 +67,23 @@ MIN_VIDEO_BYTES = int(os.environ.get("MIN_VIDEO_MB", "50")) * 1024 * 1024
 UID, GID = int(os.environ.get("PUID", "1000")), int(os.environ.get("PGID", "1000"))
 # TorBox is behind Cloudflare, which rejects Python's default User-Agent ("error code: 1010")
 USER_AGENT = os.environ.get("USER_AGENT", f"torbox-usenet-bridge/{__version__}")
+# TorBox limits (Pro: 10 active downloads, 60 createusenetdownload calls per hour)
+MAX_ACTIVE = int(os.environ.get("TORBOX_MAX_ACTIVE", "10"))
+SUBMITS_PER_HOUR = int(os.environ.get("TORBOX_SUBMITS_PER_HOUR", "55"))
 # Language guard (disabled unless ARRS and REQUIRED_AUDIO_LANGS are set): "name|url|apikey", comma separated
 ARRS = [a.split("|") for a in os.environ.get("ARRS", "").split(",") if a.count("|") == 2]
 LANGS = [l.strip() for l in os.environ.get("REQUIRED_AUDIO_LANGS", "").split(",") if l.strip()]
 REQUIRED = re.compile(r"\b(" + "|".join(map(re.escape, LANGS)) + r")\b", re.I) if LANGS else None
 GUARD_RELEASE = re.compile(os.environ.get("GUARD_RELEASE_REGEX", r"\bMULTI\b"), re.I)
-GUARD_SECONDS = int(os.environ.get("GUARD_SECONDS", "300"))
+GUARD_SECONDS = int(os.environ.get("GUARD_SECONDS", "120"))
+GUARD_WAKE = threading.Event()  # set by the /guard webhook -> check right after an import
+# Cleanup (off by default): deletes TorBox items that no library symlink uses
+CLEANUP_ENABLED = flag("CLEANUP_ENABLED", "0")
+CLEANUP_DRY_RUN = flag("CLEANUP_DRY_RUN", "1")
+CLEANUP_SECONDS = int(os.environ.get("CLEANUP_SECONDS", "21600"))
+CLEANUP_MIN_AGE = int(os.environ.get("CLEANUP_MIN_AGE_HOURS", "48")) * 3600
+# Other mounts whose symlinks count as "in use" (e.g. a Decypharr mount for torrents), colon separated
+EXTRA_LINK_ROOTS = [d.rstrip("/") for d in os.environ.get("EXTRA_LINK_ROOTS", "").split(":") if d]
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("torbox-usenet-bridge")
@@ -80,14 +102,31 @@ with db() as c:
         nzo_id text primary key, name text, category text, status text, torbox_id integer,
         storage text, bytes integer default 0, progress real default 0, message text default '',
         added real, finished real, nzb_file text)""")
+    if "submitted" not in [r[1] for r in c.execute("pragma table_info(jobs)")]:
+        c.execute("alter table jobs add column submitted real")  # timeout counts from submission, not queue time
+    c.execute("create table if not exists repairs (item text primary key, at real)")
 
 
 # ---------------------------------------------------------------- TorBox
-def torbox(method, path, fields=None, files=None):
-    """Minimal TorBox API call (multipart when fields/files are given)."""
+class TorBoxBusy(Exception):
+    """TorBox temporarily unavailable (429, slots full, hourly budget) -> retry later, never a failure."""
+
+
+PAUSED_UNTIL = 0.0
+SUBMITS = []  # timestamps of recent submissions
+
+
+def torbox(method, path, fields=None, files=None, body=None):
+    """Minimal TorBox API call (multipart when fields/files are given, JSON when body is given)."""
+    global PAUSED_UNTIL
+    if time.time() < PAUSED_UNTIL:
+        raise TorBoxBusy("TorBox API paused after 429 until " + time.strftime("%H:%M:%S", time.localtime(PAUSED_UNTIL)))
     headers = {"Authorization": "Bearer " + TORBOX_KEY, "User-Agent": USER_AGENT}
     data = None
-    if fields is not None or files is not None:
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    elif fields is not None or files is not None:
         boundary = uuid.uuid4().hex
         parts = []
         for k, v in (fields or {}).items():
@@ -103,19 +142,49 @@ def torbox(method, path, fields=None, files=None):
         with urllib.request.urlopen(req, timeout=120) as r:
             return json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
+        text = e.read().decode(errors="replace")
+        if e.code == 429:  # the lockout applies to the whole key (~5 min) -> pause every caller
+            PAUSED_UNTIL = time.time() + int(e.headers.get("Retry-After") or 300)
+            log.warning("TorBox 429 (%s) -> pausing until %s", text[:80], time.strftime("%H:%M:%S", time.localtime(PAUSED_UNTIL)))
+            raise TorBoxBusy("TorBox 429")
         try:
-            return json.loads(body)
+            return json.loads(text)
         except ValueError:
-            return {"success": False, "detail": f"HTTP {e.code}: {body[:200]}"}
+            return {"success": False, "detail": f"HTTP {e.code}: {text[:200]}"}
+
+
+def torbox_list(kind):
+    """Full mylist (TorBox returns at most 1000 entries per page)."""
+    out, seen, offset = [], set(), 0
+    while True:
+        page = torbox("GET", f"/{kind}/mylist?bypass_cache=true&offset={offset}&limit=1000").get("data") or []
+        new = [d for d in page if d.get("id") not in seen]
+        seen.update(d.get("id") for d in new)
+        out += new
+        if len(page) < 1000 or not new:
+            return out
+        offset += len(page)
+
+
+def active_downloads():
+    """Entries occupying a TorBox slot (TorBox flags them with active=true, incl. unpacking and seeding)."""
+    return sum(1 for kind in ("usenet", "torrents") for d in torbox_list(kind) if d.get("active"))
 
 
 def submit_nzb(name, nzb_bytes):
+    now = time.time()
+    SUBMITS[:] = [t for t in SUBMITS if now - t < 3600]
+    if len(SUBMITS) >= SUBMITS_PER_HOUR:
+        raise TorBoxBusy("hourly budget for new usenet downloads reached")
+    SUBMITS.append(now)
     r = torbox("POST", "/usenet/createusenetdownload", fields={"name": name}, files={"file": (name + ".nzb", nzb_bytes)})
     d = r.get("data") or {}
     tid = d.get("usenetdownload_id") or d.get("id")
     if not r.get("success") or not tid:
-        raise RuntimeError(r.get("detail") or r.get("error") or "TorBox rejected the download")
+        msg = str(r.get("detail") or r.get("error") or "TorBox rejected the download")
+        if re.search(r"active download limit|slot|per 1 hour|rate limit|too many", msg, re.I):
+            raise TorBoxBusy(msg)
+        raise RuntimeError(msg)
     return int(tid)
 
 
@@ -158,6 +227,8 @@ def webdav_paths(item):
         rel = f.get("short_name") or os.path.basename(f.get("name") or "")
         if not rel.lower().endswith(VIDEO_EXT) or (f.get("size") or 0) < MIN_VIDEO_BYTES:
             continue
+        if re.search(r"(^|[/._-])sample([/._-]|$)", (f.get("name") or rel).lower()):
+            continue  # sample clips (Sample/...) make imports in Radarr/Sonarr fail
         candidates = [os.path.join(base, rel)]
         full = f.get("name") or ""
         if "/" in full:  # TorBox sometimes reports "<folder>/<file>"
@@ -170,6 +241,9 @@ def finalize(job, item):
     """Create the symlinks once the files are visible in the mount. Returns True when done."""
     files = webdav_paths(item)
     if not files:
+        names = [(f.get("short_name") or f.get("name") or "").lower() for f in item.get("files") or []]
+        if any(re.search(r"\.(rar|r\d\d|\d{3})$", n) for n in names):
+            raise RuntimeError("Only RAR archives, TorBox could not extract them (incomplete release)")
         raise RuntimeError("No video file found in the TorBox download")
     target_dir = os.path.join(COMPLETE_DIR, job["category"] or "", job["name"])
     links, total = [], 0
@@ -196,11 +270,28 @@ def worker():
         try:
             with DB_LOCK, db() as c:
                 jobs = [dict(r) for r in c.execute("select * from jobs where status in ('Queued','Downloading','Processing')")]
+            # check free TorBox slots once per pass, and only if something needs to be submitted
+            free = None
+            if any(not j["torbox_id"] for j in jobs):
+                try:
+                    free = MAX_ACTIVE - active_downloads()
+                except TorBoxBusy:
+                    free = 0
             for job in jobs:
                 try:
                     if not job["torbox_id"]:
-                        tid = submit_nzb(job["name"], open(job["nzb_file"], "rb").read())
-                        set_job(job["nzo_id"], torbox_id=tid, status="Downloading")
+                        if free is not None and free <= 0:
+                            if job["message"] != "Waiting for a free TorBox slot":
+                                set_job(job["nzo_id"], message="Waiting for a free TorBox slot")
+                            continue
+                        try:
+                            tid = submit_nzb(job["name"], open(job["nzb_file"], "rb").read())
+                        except TorBoxBusy as e:
+                            free = 0  # slots full / hourly budget / 429 -> stay queued, retry later
+                            set_job(job["nzo_id"], message=f"Waiting: {e}"[:300])
+                            continue
+                        free = (free or 1) - 1
+                        set_job(job["nzo_id"], torbox_id=tid, status="Downloading", submitted=time.time(), message="")
                         log.info("Submitted %s to TorBox (id %s)", job["nzo_id"], tid)
                         continue
                     item = torbox_item(job["torbox_id"])
@@ -215,8 +306,10 @@ def worker():
                         finalize(job, item)
                     elif state in ("processing", "uploading", "completed") or item.get("download_finished"):
                         set_job(job["nzo_id"], status="Processing")
-                    if time.time() - job["added"] > JOB_TIMEOUT:
+                    if time.time() - (job["submitted"] or job["added"]) > JOB_TIMEOUT:
                         raise RuntimeError("Timed out")
+                except TorBoxBusy:
+                    continue  # temporary (429) -> next pass, not a failure
                 except Exception as e:  # one broken job must not block the others
                     log.warning("Job %s failed: %s", job["nzo_id"], e)
                     set_job(job["nzo_id"], status="Failed", message=str(e)[:300], finished=time.time())
@@ -249,10 +342,73 @@ def repair_loop():
                         if os.path.islink(lp):
                             item_name = os.readlink(lp)[len(MOUNT_DIR) + 1:].split("/")[0]
                 if item_name in broken and os.path.exists(job["nzb_file"]):
-                    tid = submit_nzb(job["name"], open(job["nzb_file"], "rb").read())
+                    with DB_LOCK, db() as c:
+                        last = c.execute("select at from repairs where item=?", (item_name,)).fetchone()
+                    if last and time.time() - last[0] < 24 * 3600:
+                        continue  # at most once per day (TorBox treats constant re-adds as abuse)
+                    try:
+                        tid = submit_nzb(job["name"], open(job["nzb_file"], "rb").read())
+                    except TorBoxBusy:
+                        break
+                    with DB_LOCK, db() as c:
+                        c.execute("insert or replace into repairs (item, at) values (?,?)", (item_name, time.time()))
                     log.info("Repair: resubmitted %s to TorBox (id %s)", item_name, tid)
         except Exception:
             log.exception("Repair error")
+
+
+# ---------------------------------------------------------------- Cleanup (optional)
+def used_names():
+    """Names of all TorBox downloads that a library symlink points to (MOUNT_DIR and EXTRA_LINK_ROOTS)."""
+    names = set()
+    for root in LIBRARY_DIRS:
+        for dp, _, fns in os.walk(root):
+            for fn in fns:
+                p = os.path.join(dp, fn)
+                if not os.path.islink(p):
+                    continue
+                target = os.readlink(p)
+                for base in [MOUNT_DIR] + EXTRA_LINK_ROOTS:
+                    if target.startswith(base + "/"):
+                        name = target[len(base) + 1:].split("/")[0]
+                        names.update({name, os.path.splitext(name)[0]})
+    return names
+
+
+def cleanup_candidates():
+    """TorBox downloads no library file uses anymore, that are finished/failed and old enough."""
+    used = used_names()
+    if not used:
+        return []  # empty library or missing mount -> rather delete nothing
+    with DB_LOCK, db() as c:
+        active = {r[0] for r in c.execute("select torbox_id from jobs where status in ('Queued','Downloading','Processing')")}
+    out = []
+    for kind, id_field in (("usenet", "usenet_id"), ("torrents", "torrent_id")):
+        for d in torbox_list(kind):
+            name = d.get("name") or ""
+            created = time.mktime(time.strptime((d.get("created_at") or "")[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+            done = d.get("download_finished") or d.get("download_present") or "fail" in (d.get("download_state") or "").lower()
+            if (name in used or os.path.splitext(name)[0] in used or d.get("id") in active or not done
+                    or time.time() - created < CLEANUP_MIN_AGE):
+                continue
+            out.append((kind, id_field, d["id"], name))
+    return out
+
+
+def cleanup_loop():
+    """Remove rejected/replaced/broken downloads from TorBox so only the version in use remains."""
+    while CLEANUP_ENABLED:
+        try:
+            for kind, id_field, tid, name in cleanup_candidates():
+                if CLEANUP_DRY_RUN:
+                    log.info("Cleanup (dry run): would delete %s %s: %s", kind, tid, name)
+                    continue
+                path = "/usenet/controlusenetdownload" if kind == "usenet" else "/torrents/controltorrent"
+                r = torbox("POST", path, body={id_field: tid, "operation": "delete"})
+                log.info("Cleanup: deleted %s %s (%s): %s", kind, tid, "ok" if r.get("success") else r.get("detail"), name)
+        except Exception:
+            log.exception("Cleanup error")
+        time.sleep(CLEANUP_SECONDS)
 
 
 # ---------------------------------------------------------------- Audio language guard
@@ -280,9 +436,41 @@ def reject_file(name, base, key, file_id, file_kind, history_query, label):
     log.info("Language guard [%s]: %s has none of %s -> blocklisted, removed, searching again", name, label, LANGS)
 
 
+def unstick_imports(name, base, key):
+    """Large files on the TorBox mount can make Radarr/Sonarr fail to read the runtime in time
+    ("Unable to determine if file is a sample") -> they stay in importPending -> import them manually."""
+    radarr = name.lower().startswith("radarr")
+    for r in (arr(base, key, "GET", "/queue?pageSize=200") or {}).get("records", []):
+        msgs = " ".join(m for s in r.get("statusMessages") or [] for m in s.get("messages") or [])
+        if r.get("trackedDownloadState") != "importPending" or "sample" not in msgs.lower():
+            continue
+        qs = urllib.parse.urlencode({"downloadId": r["downloadId"], "folder": r.get("outputPath") or "", "filterExistingFiles": "true"})
+        files = []
+        for c in arr(base, key, "GET", "/manualimport?" + qs) or []:
+            item = {"path": c["path"], "quality": c["quality"], "languages": c.get("languages") or [],
+                    "releaseGroup": c.get("releaseGroup"), "downloadId": r["downloadId"], "indexerFlags": c.get("indexerFlags", 0)}
+            if radarr:
+                item["movieId"] = r["movieId"]
+            else:
+                eps = [e["id"] for e in c.get("episodes") or []]
+                if not eps or not c.get("series"):
+                    continue
+                item.update(seriesId=c["series"]["id"], episodeIds=eps)
+            files.append(item)
+        if files:
+            arr(base, key, "POST", "/command", {"name": "ManualImport", "files": files, "importMode": "auto"})
+            log.info("Stuck import [%s]: %s imported manually (%d file(s))", name, r.get("title"), len(files))
+
+
 def language_guard():
-    while ARRS and REQUIRED:
+    while ARRS:
         for name, base, key in ARRS:
+            try:
+                unstick_imports(name, base, key)
+            except Exception:
+                log.exception("Stuck-import check failed for %s", name)
+            if not REQUIRED:
+                continue
             try:
                 if name.lower().startswith("radarr"):
                     for m in arr(base, key, "GET", "/movie"):
@@ -305,7 +493,9 @@ def language_guard():
                                 reject_file(name, base, key, f["id"], "episodefile", q, f"{s['title']} {title} ({langs})")
             except Exception:
                 log.exception("Language guard error for %s", name)
-        time.sleep(GUARD_SECONDS)
+        if GUARD_WAKE.wait(GUARD_SECONDS):
+            GUARD_WAKE.clear()
+            time.sleep(20)  # Radarr/Sonarr need a moment after the import to read mediaInfo (audio tracks)
 
 
 # ---------------------------------------------------------------- SABnzbd API
@@ -367,7 +557,14 @@ class Handler(BaseHTTPRequestHandler):
         return q, files
 
     def handle_api(self):
-        if not urllib.parse.urlparse(self.path).path.rstrip("/").endswith("/api"):
+        url = urllib.parse.urlparse(self.path)
+        if url.path.rstrip("/") == "/guard":  # Radarr/Sonarr webhook (Connect -> Webhook, "On Import")
+            if dict(urllib.parse.parse_qsl(url.query)).get("apikey") != SAB_KEY:
+                return self.reply({"status": False}, 403)
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            GUARD_WAKE.set()
+            return self.reply({"status": True})
+        if not url.path.rstrip("/").endswith("/api"):
             return self.reply({"error": "not found"}, 404)
         q, files = self.params()
         mode = q.get("mode", "")
@@ -431,6 +628,8 @@ if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=repair_loop, daemon=True).start()
     threading.Thread(target=language_guard, daemon=True).start()
-    log.info("torbox-usenet-bridge %s listening on :%d (mount %s, complete dir %s, language guard %s)",
-             __version__, PORT, MOUNT_DIR, COMPLETE_DIR, LANGS if REQUIRED and ARRS else "off")
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+    log.info("torbox-usenet-bridge %s listening on :%d (mount %s, complete dir %s, language guard %s, cleanup %s)",
+             __version__, PORT, MOUNT_DIR, COMPLETE_DIR, LANGS if REQUIRED and ARRS else "off",
+             ("dry run" if CLEANUP_DRY_RUN else "on") if CLEANUP_ENABLED else "off")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
